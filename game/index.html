@@ -195,10 +195,10 @@ label("CLIMB", 0, 3.0, 19); block(0, 0.75, 20, 3, 1.5, 2);
 label("LEDGE · SHIMMY", 0, 4.6, 25.5); block(0, 1.6, 29.5, 8, 3.2, 6);
 // --- rooftops (+X): catch the higher ledge, sprint gaps, drop-roll
 label("ROOFTOPS", 9, 6.2, 26.5);
-block(10, 2.2, 29.5, 5, 4.4, 6, MAT.roof);      // B1: 1.2 m higher than the ledge block, 3 m gap -> catch the ledge
-block(18, 2.2, 29.5, 5, 4.4, 6, MAT.roof);      // B2: 3 m sprint gap, same height
-block(26.5, 1.6, 29.5, 5, 3.2, 6, MAT.roof);    // B3: 3.5 m gap, 1.2 m drop -> roll
-ladder(10, 26.45, 0, -1, 4.4);                   // ladder up B1 from the street side
+block(10, 2.5, 29.5, 5, 5.0, 6, MAT.roof);      // B1: 1.8 m higher than the ledge block, 3.5 m gap -> catch the ledge mid-jump
+block(18, 2.5, 29.5, 5, 5.0, 6, MAT.roof);      // B2: 3 m sprint gap, same height
+block(26.5, 1.6, 29.5, 5, 3.2, 6, MAT.roof);    // B3: 3.5 m gap, 1.8 m drop -> roll
+ladder(10, 26.45, 0, -1, 5.0);                   // ladder up B1 from the street side
 label("BAR", 26.5, 6.8, 35);
 block(26.5, 1.6, 44.5, 5, 3.2, 6, MAT.roof);    // B4 across a 9 m gap: bar traverse
 bar([26.5, 5.35, 32.3], [26.5, 5.35, 41.7]);
@@ -474,7 +474,7 @@ function updateRM(dt) {
 function toMove(anim = "Idle", fade = 0.25) { const p = player; p.state = "move"; p.grounded = true; p.vel.set(0, 0, 0); p.anim.play(anim, { fade }); }
 function hangOn(ledge) {
   const p = player;
-  p.state = "hang"; p.hang = ledge; p.vel.set(0, 0, 0);
+  p.state = "hang"; p.hang = ledge; p.vel.set(0, 0, 0); p.t = 0;
   p.yaw = Math.atan2(-ledge.n.x, -ledge.n.z);
   placeHang();
   p.anim.play("Hang_Idle", { fade: 0.14 }); shake(0.12);
@@ -666,7 +666,8 @@ function updatePlayer(dt) {
     case "hang": {
       const h = p.hang; prompt = "A/D shimmy · Space climb · C drop";
       const side = (keys.KeyA ? 1 : 0) - (keys.KeyD ? 1 : 0);   // + = character's left
-      if (jump || (keys.KeyW && !side)) { climbFromHang(); break; }
+      p.t += dt;
+      if (jump || (keys.KeyW && !side && p.t > 0.35)) { climbFromHang(); break; }
       if (slide || keys.KeyS) { p.state = "move"; p.grounded = false; p.air = 0.3; p.vel.copy(h.n).multiplyScalar(1.2); p.pos.addScaledVector(h.n, 0.15); p.anim.play("Fall", { fade: 0.2 }); break; }
       if (side) {
         const left = rotY(new V3(1, 0, 0), p.yaw);
