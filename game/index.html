@@ -261,9 +261,10 @@ function collide(body, dt, r, h, wasGrounded) {
   }
   return false;
 }
-function rayBoxes(o, d, maxT) {   // slab test, returns nearest t
+function rayBoxes(o, d, maxT) {   // slab test, returns nearest t (boxes containing the origin are ignored)
   let best = maxT;
   for (const b of boxes) {
+    if (o.x > b.min.x && o.x < b.max.x && o.y > b.min.y && o.y < b.max.y && o.z > b.min.z && o.z < b.max.z) continue;
     let t0 = 0, t1 = best, ok = true;
     for (const ax of ["x", "y", "z"]) {
       if (Math.abs(d[ax]) < 1e-8) { if (o[ax] < b.min[ax] || o[ax] > b.max[ax]) { ok = false; break; } continue; }
@@ -482,6 +483,8 @@ function hangOn(ledge) {
 function placeHang() {
   const p = player, h = p.hang; const off = rotY(HANDS.Hang_Idle, p.yaw);
   p.pos.set(h.pt.x - off.x, h.top - off.y, h.pt.z - off.z);
+  const out = (p.pos.x - h.pt.x) * h.n.x + (p.pos.z - h.pt.z) * h.n.z;   // keep the body clear of the wall
+  if (out < 0.3) p.pos.addScaledVector(h.n, 0.3 - out);
 }
 function climbFromHang() {
   const p = player, h = p.hang;
@@ -823,7 +826,14 @@ class Enemy {
       this.cool -= dt;
       if (aware) {
         this.yaw += angDiff(this.yaw, Math.atan2(d.x, d.z)) * Math.min(1, dt * 8);
-        if (dist > 1.35) {
+        const engaged = enemies.filter((o) => o !== this && !o.dead && o.pos.distanceTo(p.pos) < 1.9).length;
+        const hold = engaged >= 2 && dist < 3.2;   // wait your turn: circle at range
+        if (hold) {
+          const side = new V3(-d.z, 0, d.x).normalize().multiplyScalar(this.spawn.x > -20 ? 1 : -1);
+          const back = dist < 2.6 ? -1 : 0; const f = fwdOf(this.yaw);
+          this.vel.x = lerp(this.vel.x, side.x * 1.1 + f.x * back, dt * 4); this.vel.z = lerp(this.vel.z, side.z * 1.1 + f.z * back, dt * 4);
+          this.anim.play("Fight_Idle", { fade: 0.3 });
+        } else if (dist > 1.35) {
           const sp = dist > 4 ? 3.6 : 1.6; const f = fwdOf(this.yaw);
           this.vel.x = lerp(this.vel.x, f.x * sp, dt * 6); this.vel.z = lerp(this.vel.z, f.z * sp, dt * 6);
           this.anim.play(sp > 2 ? "Running" : "Walking", { fade: 0.2, speed: sp > 2 ? 0.85 : 1 });
