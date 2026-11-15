@@ -523,18 +523,18 @@ function nearestEnemy(range, cone = 1.2) {
   return best;
 }
 const ATK = {
-  Jab: { dmg: 12, range: 1.45, hit: 0.32, combo: 0.45, push: 1.5 },
-  Cross: { dmg: 15, range: 1.5, hit: 0.36, combo: 0.5, push: 2 },
-  Hook: { dmg: 22, range: 1.5, hit: 0.42, combo: 0.6, push: 4, big: true },
-  Kick: { dmg: 26, range: 1.8, hit: 0.42, combo: 0.75, push: 5, big: true },
-  Pipe_Swing: { dmg: 30, range: 1.9, hit: 0.4, combo: 0.55, push: 3 },
-  Pipe_Backhand: { dmg: 30, range: 1.9, hit: 0.38, combo: 0.55, push: 3 },
-  Pipe_Smash: { dmg: 48, range: 1.9, hit: 0.45, combo: 0.75, push: 6, big: true },
+  Jab: { dmg: 12, range: 1.7, hit: 0.32, combo: 0.45, push: 1.5 },
+  Cross: { dmg: 15, range: 1.7, hit: 0.36, combo: 0.5, push: 2 },
+  Hook: { dmg: 22, range: 1.75, hit: 0.42, combo: 0.6, push: 4, big: true },
+  Kick: { dmg: 26, range: 2.0, hit: 0.42, combo: 0.75, push: 5, big: true },
+  Pipe_Swing: { dmg: 30, range: 2.1, hit: 0.4, combo: 0.55, push: 3 },
+  Pipe_Backhand: { dmg: 30, range: 2.1, hit: 0.38, combo: 0.55, push: 3 },
+  Pipe_Smash: { dmg: 48, range: 2.1, hit: 0.45, combo: 0.75, push: 6, big: true },
 };
 function startAttack(name) {
   const p = player; const clip = CLIPS[name]; if (!clip) return;
-  const e = nearestEnemy(3.5); if (e) p.yaw = Math.atan2(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
-  p.state = "attack"; p.atk = { name, t: 0, dur: clip.duration, did: false, ...ATK[name] }; p.queued = false;
+  const e = nearestEnemy(3.5, 1.6); if (e) p.yaw = Math.atan2(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
+  p.state = "attack"; p.atk = { name, t: 0, dur: clip.duration, did: false, target: e, ...ATK[name] }; p.queued = false;
   p.anim.play(name, { once: true, fade: 0.08, restart: true, speed: 1.15 });
 }
 function nextCombo(name) {
@@ -596,8 +596,11 @@ function updatePlayer(dt) {
       p.jumpBuf = jump ? 0.14 : p.jumpBuf - dt;
       const sp = Math.hypot(p.vel.x, p.vel.z);
       // ladders / ropes / bars / ledges
-      const nearRope = ROPES.find((r) => Math.hypot(p.pos.x - r.x, p.pos.z - r.z) < 0.75 && p.pos.y < r.y1 - 1 && p.pos.y > r.y0 - 0.6);
-      if (nearRope && (use || (!p.grounded && Math.hypot(p.pos.x - nearRope.x, p.pos.z - nearRope.z) < 0.6))) { grabRope(nearRope); break; }
+      const nearRope = ROPES.find((r) => Math.hypot(p.pos.x - r.x, p.pos.z - r.z) < 1.2 && p.pos.y < r.y1 - 1 && p.pos.y > r.y0 - 0.6);
+      if (nearRope) {
+        const rd = Math.hypot(p.pos.x - nearRope.x, p.pos.z - nearRope.z); prompt = "E · grab rope";
+        if (use || (!p.grounded && rd < 0.7) || (moving && rd < 0.6)) { grabRope(nearRope); break; }
+      }
       const nearLadder = LADDERS.find((l) => { const d = new V3(p.pos.x - l.x, 0, p.pos.z - l.z); return d.dot(l.n) > 0 && d.dot(l.n) < 0.8 && Math.abs(d.dot(new V3(-l.n.z, 0, l.n.x))) < l.w && p.pos.y < l.y1 - 0.5; });
       if (nearLadder) { prompt = "E · climb ladder"; if (use || (moving && input.dot(nearLadder.n) < -0.7 && p.grounded)) { grabLadder(nearLadder); break; } }
       if (!p.grounded) {
@@ -616,8 +619,8 @@ function updatePlayer(dt) {
       } else {
         if (!wasG) {   // landing
           p.air = 0;
-          if (vyBefore < -13) {
-            if (sp > 3) { p.state = "roll"; p.t = 0; p.anim.play("Roll_Land", { once: true, fade: 0.08, speed: 1.15, restart: true }); shake(0.18); break; }
+          if (vyBefore < -10.5) {
+            if (sp > 3 || vyBefore > -15) { p.state = "roll"; p.t = 0; p.anim.play("Roll_Land", { once: true, fade: 0.08, speed: 1.15, restart: true }); shake(0.18); break; }
             p.state = "land"; p.t = 0; p.anim.play("Land", { once: true, fade: 0.06, restart: true }); shake(0.22); p.vel.x *= 0.2; p.vel.z *= 0.2; break;
           }
         }
@@ -721,7 +724,9 @@ function updatePlayer(dt) {
     }
     case "attack": {
       const a = p.atk; a.t += dt * 1.15;
-      if (a.t < a.dur * 0.3) { const f = fwdOf(p.yaw); p.vel.x = f.x * 1.6; p.vel.z = f.z * 1.6; } else { p.vel.x *= 0.8; p.vel.z *= 0.8; }
+      if (a.target && !a.target.dead) { p.yaw += angDiff(p.yaw, Math.atan2(a.target.pos.x - p.pos.x, a.target.pos.z - p.pos.z)) * Math.min(1, dt * 12); }
+      const gap = a.target ? a.target.pos.distanceTo(p.pos) - 1.0 : 0.3;
+      if (a.t < a.dur * 0.35 && gap > 0) { const f = fwdOf(p.yaw), lv = Math.min(5, gap * 6 + 1); p.vel.x = f.x * lv; p.vel.z = f.z * lv; } else { p.vel.x *= 0.8; p.vel.z *= 0.8; }
       p.grounded = collide(p, dt, R, HEIGHT, true);
       if (attack || heavy) p.queued = heavy ? "heavy" : "light";
       if (!a.did && a.t >= a.dur * a.hit) {
@@ -851,7 +856,7 @@ window.__drifter = {
   step(sec, dt = 1 / 60) { for (let t = 0; t < sec; t += dt) tick(dt); renderer.render(scene, camera); return this.state(); },
   key(code, down) { if (down) { if (!keys[code]) pressed.add(code); keys[code] = true; } else keys[code] = false; },
   tap(code) { pressed.add(code); },
-  state() { const p = player; return { state: p.state, clip: p.anim.name, pos: p.pos.toArray().map((v) => +v.toFixed(2)), yaw: +p.yaw.toFixed(2), hp: Math.round(p.hp), weapon: !!p.weapon, raiders: enemies.map((e) => e.dead ? "dead" : Math.round(e.hp)) }; },
+  state() { const p = player; return { state: p.state, clip: p.anim.name, pos: p.pos.toArray().map((v) => +v.toFixed(2)), yaw: +p.yaw.toFixed(2), hp: Math.round(p.hp), weapon: !!p.weapon, raiders: enemies.map((e) => e.dead ? "dead" : Math.round(e.hp) + "@" + e.pos.distanceTo(p.pos).toFixed(1) + e.state[0]) }; },
   set(x, y, z, yaw = 0) { player.pos.set(x, y, z); player.yaw = yaw; player.vel.set(0, 0, 0); cam.yaw = yaw + Math.PI; toMove("Idle", 0); },
 };
 function tick(dt) {
