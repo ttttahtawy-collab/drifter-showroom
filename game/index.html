@@ -506,7 +506,7 @@ function tryTraversal(intent) {   // Space on the ground: vault / climb / wall r
     startRM("Climb_Box", warpFor("Climb_Box", ob.h, ob.near + 0.55), () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); }, { speed: 1.5 });
     return true;
   }
-  if (ob.h <= 3.3 && sp > 3.2) {
+  if (ob.h <= 3.3 && sp > 5.5) {   // sprinting: run up the wall; otherwise a jump catches the ledge
     const name = "Wall_Climb";
     startRM(name, warpFor(name, ob.h, ob.near + 0.55), () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); });
     return true;
