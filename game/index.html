@@ -842,7 +842,18 @@ class Enemy {
 const clock = new THREE.Clock();
 function loop() {
   requestAnimationFrame(loop);
-  let dt = Math.min(clock.getDelta(), 1 / 30);
+  tick(Math.min(clock.getDelta(), 1 / 30));
+  renderer.render(scene, camera);
+}
+// test hook: deterministic stepping from the console (window.__drifter.step(seconds))
+window.__drifter = {
+  step(sec, dt = 1 / 60) { for (let t = 0; t < sec; t += dt) tick(dt); renderer.render(scene, camera); return this.state(); },
+  key(code, down) { if (down) { if (!keys[code]) pressed.add(code); keys[code] = true; } else keys[code] = false; },
+  tap(code) { pressed.add(code); },
+  state() { const p = player; return { state: p.state, clip: p.anim.name, pos: p.pos.toArray().map((v) => +v.toFixed(2)), yaw: +p.yaw.toFixed(2), hp: Math.round(p.hp), weapon: !!p.weapon, raiders: enemies.map((e) => e.dead ? "dead" : Math.round(e.hp)) }; },
+  set(x, y, z, yaw = 0) { player.pos.set(x, y, z); player.yaw = yaw; player.vel.set(0, 0, 0); cam.yaw = yaw + Math.PI; toMove("Idle", 0); },
+};
+function tick(dt) {
   if (hitstop > 0) { hitstop -= dt; dt *= 0.08; }
   const p = player;
   updatePlayer(dt);
@@ -865,7 +876,6 @@ function loop() {
   $("hp").style.width = p.hp + "%"; $("hpn").textContent = Math.round(p.hp);
   const sp = Math.hypot(p.vel.x, p.vel.z);
   $("status").innerHTML = `state <b>${p.state}</b><br>clip <b>${p.anim.name}</b><br>speed <b>${sp.toFixed(1)}</b> m/s · height <b>${p.pos.y.toFixed(1)}</b> m<br>raiders <b>${enemies.filter((e) => !e.dead).length}</b>/${enemies.length}${p.weapon ? "<br>holding <b>pipe</b>" : ""}`;
-  renderer.render(scene, camera);
 }
 </script>
 </body>
