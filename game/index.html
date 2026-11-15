@@ -459,14 +459,14 @@ function startRM(name, warp, onEnd, o = {}) {
 }
 function warpFor(name, wantUp, wantFwd) {
   const e = RM[name].end;   // model space: y up, z forward
-  return { sy: Math.abs(e.y) > 0.15 ? wantUp / e.y : 1, addY: Math.abs(e.y) > 0.15 ? 0 : wantUp, sz: Math.abs(e.z) > 0.15 ? clamp(wantFwd / e.z, 0.4, 2.5) : 1, addZ: Math.abs(e.z) > 0.15 ? 0 : wantFwd };
+  return { sx: 0, sy: Math.abs(e.y) > 0.15 ? wantUp / e.y : 1, addY: Math.abs(e.y) > 0.15 ? 0 : wantUp, sz: Math.abs(e.z) > 0.15 ? clamp(wantFwd / e.z, 0.4, 2.5) : 1, addZ: Math.abs(e.z) > 0.15 ? 0 : wantFwd };
 }
 function updateRM(dt) {
   const p = player, r = p.rm; const a = r.act; const dur = r.rm.dur;
   const t = Math.min(a.time, dur), k = t / dur;
   const d = sampleRM(r.rm, t);
-  const w = r.warp || { sy: 1, sz: 1, addY: 0, addZ: 0 };
-  const local = new V3(d.x, d.y * w.sy + w.addY * k, d.z * w.sz + w.addZ * k);
+  const w = r.warp || { sx: 1, sy: 1, sz: 1, addY: 0, addZ: 0 };
+  const local = new V3(d.x * (w.sx ?? 1), d.y * w.sy + w.addY * k, d.z * w.sz + w.addZ * k);
   p.pos.copy(r.origin).add(rotY(local, r.yaw));
   if (t >= dur - 1e-3 || !a.isRunning()) { const cb = r.onEnd; p.rm = null; cb && cb(); }
 }
@@ -490,20 +490,20 @@ function climbFromHang() {
   startRM("Climb_Up", warpFor("Climb_Up", h.top - p.pos.y, wantFwd), () => { p.pos.y = h.top; toMove("Idle", 0.3); });
 }
 
-function tryTraversal() {   // Space on the ground: vault / climb / wall run-up before a normal jump
-  const p = player; const sp = Math.hypot(p.vel.x, p.vel.z);
+function tryTraversal(intent) {   // Space on the ground: vault / climb / wall run-up before a normal jump
+  const p = player; const sp = Math.max(Math.hypot(p.vel.x, p.vel.z), intent);
   const ob = obstacleAhead(p.pos, p.yaw, sp > 3 ? 1.3 : 0.8); if (!ob) return false;
   const f = fwdOf(p.yaw);
   if (ob.h <= 1.2 && ob.depth < 1.6 && sp > 1.5) {
     const land = p.pos.clone().addScaledVector(f, ob.near + ob.depth + 1.1);
     const g = groundAt(land.x, land.z, 0.25, p.pos.y + 0.5);
     if (g > -Infinity) {
-      startRM("Dive_Over", warpFor("Dive_Over", g - p.pos.y, ob.near + ob.depth + 1.1), () => { p.pos.y = g; toMove(sp > 4 ? "Running" : "Idle", 0.2); p.vel.copy(f).multiplyScalar(Math.min(sp, 5)); }, { speed: 1.25 });
+      startRM("Dive_Over", warpFor("Dive_Over", g - p.pos.y, ob.near + ob.depth + 1.1), () => { p.pos.y = g; toMove(sp > 4 ? "Running" : "Idle", 0.2); p.vel.copy(f).multiplyScalar(Math.min(sp, 5)); }, { speed: 1.35 });
       return true;
     }
   }
   if (ob.h <= 1.9) {
-    startRM("Climb_Box", warpFor("Climb_Box", ob.h, ob.near + 0.55), () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); });
+    startRM("Climb_Box", warpFor("Climb_Box", ob.h, ob.near + 0.55), () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); }, { speed: 1.5 });
     return true;
   }
   if (ob.h <= 3.3 && sp > 3.2) {
@@ -623,7 +623,7 @@ function updatePlayer(dt) {
         }
         if (p.jumpBuf > 0 && p.coyote > 0) {
           p.jumpBuf = 0;
-          if (!tryTraversal()) {
+          if (!tryTraversal(moving ? (sprint ? 7 : 4) : 0)) {
             const ledge = findLedge(p.pos, p.yaw, 1.6, 2.4, 0.9);
             if (ledge && sp < 3) { hangOn(ledge); break; }
             p.vel.y = 8.4; p.grounded = false; p.coyote = 0; p.air = 0;
@@ -631,7 +631,7 @@ function updatePlayer(dt) {
           }
           break;
         }
-        if (slide && sp > 3.5) { p.state = "slide"; p.t = 0; p.slideV = Math.max(sp, 7); p.anim.play("Slide", { once: true, fade: 0.1, start: 0.25, speed: 1.1, restart: true }); break; }
+        if (slide && moving && (sp > 3 || sprint)) { p.state = "slide"; p.t = 0; p.slideV = Math.max(sp, 7); p.anim.play("Slide", { once: true, fade: 0.1, start: 0.25, speed: 1.1, restart: true }); break; }
         if (attack) { startAttack(p.weapon ? "Pipe_Swing" : "Jab"); break; }
         if (heavy) { startAttack(p.weapon ? "Pipe_Smash" : "Kick"); break; }
         if (use && pickupPipe()) break;
