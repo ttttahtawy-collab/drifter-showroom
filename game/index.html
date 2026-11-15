@@ -56,14 +56,14 @@ canvas { display: block; width: 100%; height: 100%; outline: none; }
 <body>
 <canvas id="c" tabindex="0"></canvas>
 <div class="hud flash" id="flash"></div>
-<div class="hud title"><h1>Drift<span>e</span>r</h1><p>Movement playground · greybox</p></div>
+<div class="hud title"><h1>Drift<span>e</span>r</h1><p>Movement playground · greybox · <a href="lab.html" style="color:var(--skin);pointer-events:auto">animation lab</a></p></div>
 <div class="hud help" id="help">
   <h2>Controls (H hides)</h2>
   <div class="k"><kbd>WASD</kbd><span>Move (camera relative)</span></div>
   <div class="k"><kbd>Shift</kbd><span>Sprint</span></div>
   <div class="k"><kbd>Alt</kbd><span>Walk</span></div>
   <div class="k"><kbd>Space</kbd><span>Jump · vault · climb up</span></div>
-  <div class="k"><kbd>C / Ctrl</kbd><span>Slide (while running) · drop</span></div>
+  <div class="k"><kbd>C / Ctrl</kbd><span>Crouch / sneak · slide when running · drop</span></div>
   <div class="k"><kbd>Mouse</kbd><span>Look (click to lock)</span></div>
   <div class="k"><kbd>LMB</kbd><span>Attack combo</span></div>
   <div class="k"><kbd>RMB / F</kbd><span>Kick / heavy smash</span></div>
@@ -96,6 +96,8 @@ canvas { display: block; width: 100%; height: 100%; outline: none; }
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
+import { PoseRig } from "./anim/rig.js";
+import { buildClips } from "./anim/clips.js";
 
 const V3 = THREE.Vector3;
 const $ = (id) => document.getElementById(id);
@@ -343,46 +345,52 @@ addEventListener("wheel", (e) => { cam.dist = clamp(cam.dist + Math.sign(e.delta
 const take = (k) => { const h = pressed.has(k); pressed.delete(k); return h; };
 
 // =============================================================== animation set-up
-const RM_CLIPS = ["Climb_Up", "Climb_Box", "Wall_Climb", "Run_Jump_Up", "Dive_Over", "Vault", "Hang_Hop_Up"];
-const CLIPS = {};      // name -> clip (processed)
+// Clips are keyframed by hand in anim/clips.js (IK feet and hands). Root motion comes with the clip.
+const CLIPS = {};      // name -> clip
 const RM = {};         // name -> {times, vals, dur, end}
-let HANDS = {};        // name -> hands offset from root (model space, yaw 0)
-function prepClips(animations, model) {
-  const hips = model.getObjectByName("mixamorigHips");
-  const toRoot = new THREE.Matrix3().setFromMatrix4(hips.parent.matrixWorld);   // model at origin while preparing
-  for (const clip of animations) {
-    clip.tracks = clip.tracks.filter((t) => !(t.name.endsWith(".scale") || (t.name.endsWith(".position") && !/Hips\.position$/.test(t.name))));
-    CLIPS[clip.name] = clip;
-    if (RM_CLIPS.includes(clip.name)) {
-      const tr = clip.tracks.find((t) => /Hips\.position$/.test(t.name));
-      const v = tr.values, n = tr.times.length, v0 = new V3(v[0], v[1], v[2]);
-      const vals = [];
-      for (let i = 0; i < n; i++) {
-        const d = new V3(v[i * 3] - v0.x, v[i * 3 + 1] - v0.y, v[i * 3 + 2] - v0.z).applyMatrix3(toRoot);
-        vals.push(d); v[i * 3] = v0.x; v[i * 3 + 1] = v0.y; v[i * 3 + 2] = v0.z;   // freeze hips; the controller moves instead
-      }
-      RM[clip.name] = { times: Array.from(tr.times), vals, dur: clip.duration, end: vals[n - 1].clone() };
-    }
-  }
-}
+let LIB = null, EDGE, BAR, LAD, ROPE, PICK, SHIMMY, BARMOVE;
+const ss = (t) => t * t * (3 - 2 * t);
+function prepClips(lib) { for (const [n, e] of Object.entries(lib)) { CLIPS[n] = e.clip; if (e.rm) RM[n] = e.rm; } }
 function sampleRM(rm, t) {
   const ts = rm.times; if (t <= ts[0]) return rm.vals[0].clone(); if (t >= ts[ts.length - 1]) return rm.end.clone();
   let i = 1; while (ts[i] < t) i++;
   const a = (t - ts[i - 1]) / (ts[i] - ts[i - 1]); return rm.vals[i - 1].clone().lerp(rm.vals[i], a);
 }
-function measureHands(model, names) {
-  const mixer = new THREE.AnimationMixer(model);
-  const L = model.getObjectByName("mixamorigLeftHand"), Rh = model.getObjectByName("mixamorigRightHand");
-  const out = {};
-  for (const n of names) {
-    const a = mixer.clipAction(CLIPS[n]); a.play(); mixer.setTime(0.05); model.updateMatrixWorld(true);
-    const p = new V3(), q = new V3(); L.getWorldPosition(p); Rh.getWorldPosition(q);
-    out[n] = p.add(q).multiplyScalar(0.5); a.stop(); mixer.uncacheAction(CLIPS[n]);
-  }
+// pose features (joint positions in the character's own frame) for matching combo entry frames
+const FEAT_BONES = ["LeftHand", "RightHand", "LeftForeArm", "RightForeArm", "LeftFoot", "RightFoot", "Head", "Spine2", "Hips"];
+function featBones(model) { return FEAT_BONES.map((n) => model.getObjectByName("mixamorig" + n)); }
+function featOf(bones, model) {
+  const inv = model.matrixWorld.clone().invert(), v = new V3(), out = [];
+  for (const b of bones) { b.getWorldPosition(v).applyMatrix4(inv); out.push(v.x, v.y, v.z); }
   return out;
 }
+function measureAttacks(model, names) {   // contact frame, reach and per-frame pose features for each strike
+  const mixer = new THREE.AnimationMixer(model), bones = featBones(model);
+  for (const n of names) {
+    const clip = CLIPS[n], at = ATK[n]; if (!clip || !at) continue;
+    const a = mixer.clipAction(clip); a.play();
+    const feats = []; let best = -Infinity, hitT = 0;
+    for (let t = 0; t <= clip.duration + 1e-6; t += 1 / 30) {
+      mixer.setTime(t); model.updateMatrixWorld(true);
+      const f = featOf(bones, model); feats.push(f);
+      const z = at.limb === "foot" ? Math.max(f[14], f[17]) : Math.max(f[2], f[5]);   // forward reach of the striking limb
+      if (z > best) { best = z; hitT = t; }
+    }
+    a.stop(); mixer.uncacheAction(clip);
+    const meta = LIB[n] || {};
+    at.hitT = meta.hit ?? hitT; at.reach = at.limb === "pipe" ? 1.25 : best; at.feats = feats; at.dur = clip.duration;
+  }
+  mixer.uncacheRoot(model);
+}
+function bestEntry(name, feat) {   // the frame of `name` (before its hit) closest to the current pose
+  const at = ATK[name]; if (!at?.feats) return 0;
+  // only look in the last part of the wind-up: the strike lands 0.15-0.45 s after the press, whatever the source clip's lead-in
+  let bi = 0, bd = Infinity; const first = Math.max(0, Math.floor((at.hitT - 0.45) * 30)), last = Math.max(first, Math.floor((at.hitT - 0.15) * 30));
+  for (let i = first; i <= last; i++) { const f = at.feats[i]; let d = 0; for (let k = 0; k < f.length; k++) d += (f[k] - feat[k]) ** 2; if (d < bd) { bd = d; bi = i; } }
+  return bi / 30;
+}
 class Anim {
-  constructor(model) { this.mixer = new THREE.AnimationMixer(model); this.cur = null; this.name = ""; }
+  constructor(model, owner) { this.mixer = new THREE.AnimationMixer(model); this.cur = null; this.name = ""; this.owner = owner; this.rmAct = null; }
   play(name, o = {}) {
     const clip = CLIPS[name]; if (!clip) return null;
     const a = this.mixer.clipAction(clip);
@@ -391,7 +399,22 @@ class Anim {
     a.setLoop(o.once ? THREE.LoopOnce : THREE.LoopRepeat, Infinity); a.clampWhenFinished = !!o.once;
     a.timeScale = o.speed ?? 1; a.time = o.start ?? 0; a.play();
     if (this.cur && this.cur !== a) a.crossFadeFrom(this.cur, o.fade ?? 0.18, false);
-    this.cur = a; this.name = name; return a;
+    this.cur = a; this.name = name;
+    this.rmAct = o.rm && RM[name] ? { a, rm: RM[name], last: sampleRM(RM[name], a.time) } : null;   // owner follows the clip's root motion
+    return a;
+  }
+  update(dt) {
+    this.mixer.update(dt);
+    const r = this.rmAct;
+    if (r && this.owner) {
+      if (this.cur !== r.a) { this.rmAct = null; return; }
+      const v = sampleRM(r.rm, Math.min(r.a.time, r.rm.dur)); const d = v.clone().sub(r.last); r.last = v;
+      const w = rotY(d, this.owner.yaw); this.owner.pos.x += w.x; this.owner.pos.z += w.z;
+    }
+  }
+  sync(name, dist, cycle, fade = 0.2) {   // play a cycle locked to distance travelled (hands land where they should)
+    const a = this.play(name, { fade, speed: 0 }); if (!a) return;
+    a.timeScale = 0; a.time = (((dist / cycle) % 1) + 1) % 1 * a.getClip().duration;
   }
 }
 
@@ -400,8 +423,12 @@ const loader = new GLTFLoader();
 let player, raiderSrc;
 Promise.all([loader.loadAsync("assets/drifter.glb"), loader.loadAsync("assets/raider.glb")]).then(([pg, rg]) => {
   const model = pg.scene; model.updateMatrixWorld(true);
-  prepClips(pg.animations, model);
-  HANDS = measureHands(model, ["Hang_Idle", "Bar_Hang", "Rope_Climb", "Ladder"]);
+  LIB = buildClips(new PoseRig(model), pg.animations, model);
+  prepClips(LIB);
+  EDGE = LIB.Hang_Idle.hang; BAR = LIB.Bar_Hang.bar; LAD = LIB.Ladder.climb; ROPE = LIB.Rope_Climb.climb; PICK = LIB.Pickup.pickup;
+  SHIMMY = LIB.Shimmy_L.speed; BARMOVE = LIB.Bar_Move_L.speed;
+  measureAttacks(model, Object.keys(ATK));
+  ENGAGE = ATK.Jab.reach + CONTACT;
   setupModel(model);
   raiderSrc = rg.scene; setupModel(raiderSrc);
   init(model);
@@ -434,10 +461,11 @@ function spawnPipe(x, z) { const p = makePipe(); p.position.set(x, 0.05, z); p.r
 function init(model) {
   const root = new THREE.Group(); root.add(model); scene.add(root);
   player = {
-    root, model, anim: new Anim(model), pos: SPAWN.clone(), vel: new V3(), yaw: 0, grounded: true, air: 0,
+    root, model, anim: null, pos: SPAWN.clone(), vel: new V3(), yaw: 0, grounded: true, air: 0,
     state: "move", hp: 100, weapon: null, t: 0, rm: null, hang: null, atk: null, queued: false, hitT: 0, coyote: 0, jumpBuf: 0,
     hand: model.getObjectByName("mixamorigRightHand"),
   };
+  player.anim = new Anim(model, player); player.feat = featBones(model);
   player.anim.play("Idle");
   for (const [x, z] of [[-14, -9], [-25, -11], [-19, -20], [3, 4]]) spawnPipe(x, z);
   for (const [x, z] of [[-17, -15], [-23, -9], [-14, -19], [-25, -19]]) enemies.push(new Enemy(x, z));
@@ -458,7 +486,7 @@ function startRM(name, warp, onEnd, o = {}) {
   const p = player;
   p.state = "rm"; p.vel.set(0, 0, 0);
   const rm = RM[name];
-  p.rm = { name, rm, origin: p.pos.clone(), yaw: p.yaw, warp, onEnd, act: p.anim.play(name, { once: true, fade: o.fade ?? 0.12, speed: o.speed ?? 1, restart: true }) };
+  p.rm = { name, rm, origin: p.pos.clone(), yaw: p.yaw, warp, onEnd, at: o.at, act: p.anim.play(name, { once: true, fade: o.fade ?? 0.12, speed: o.speed ?? 1, restart: true }) };
 }
 function warpFor(name, wantUp, wantFwd) {
   const e = RM[name].end;   // model space: y up, z forward
@@ -469,8 +497,10 @@ function updateRM(dt) {
   const t = Math.min(a.time, dur), k = t / dur;
   const d = sampleRM(r.rm, t);
   const w = r.warp || { sx: 1, sy: 1, sz: 1, addY: 0, addZ: 0 };
-  const local = new V3(d.x * (w.sx ?? 1), d.y * w.sy + w.addY * k, d.z * w.sz + w.addZ * k);
+  const kw = w.kT ? ss(Math.min(1, t / w.kT)) : k;   // warp spread over the whole clip, or eased in by time kT
+  const local = new V3(d.x * (w.sx ?? 1) + (w.addX || 0) * kw, d.y * (w.sy ?? 1) + (w.addY || 0) * kw, d.z * (w.sz ?? 1) + (w.addZ || 0) * kw);
   p.pos.copy(r.origin).add(rotY(local, r.yaw));
+  if (r.at && t >= r.at.t) { const fn = r.at.fn; r.at = null; fn(); }
   if (t >= dur - 1e-3 || !a.isRunning()) { const cb = r.onEnd; p.rm = null; cb && cb(); }
 }
 
@@ -480,19 +510,16 @@ function hangOn(ledge) {
   p.state = "hang"; p.hang = ledge; p.vel.set(0, 0, 0); p.t = 0;
   p.yaw = Math.atan2(-ledge.n.x, -ledge.n.z);
   placeHang();
-  p.anim.play("Hang_Idle", { fade: 0.14 }); shake(0.12);
+  p.anim.play("Hang_Idle", { fade: 0.12 }); shake(0.1); p.travel = 0;
 }
-function placeHang() {
-  const p = player, h = p.hang; const off = rotY(HANDS.Hang_Idle, p.yaw);
-  p.pos.set(h.pt.x - off.x, h.top - off.y, h.pt.z - off.z);
-  const out = (p.pos.x - h.pt.x) * h.n.x + (p.pos.z - h.pt.z) * h.n.z;   // keep the body clear of the wall
-  if (out < 0.3) p.pos.addScaledVector(h.n, 0.3 - out);
+function placeHang() {   // the clip's hands sit EDGE.z in front of the root and EDGE.y above it
+  const p = player, h = p.hang;
+  p.pos.set(h.pt.x + h.n.x * EDGE.z, h.top - EDGE.y, h.pt.z + h.n.z * EDGE.z);
 }
 function climbFromHang() {
   const p = player, h = p.hang;
-  const fwd = fwdOf(p.yaw);
-  const wantFwd = new V3().subVectors(h.pt, p.pos).dot(fwd) + 0.45;
-  startRM("Climb_Up", warpFor("Climb_Up", h.top - p.pos.y, wantFwd), () => { p.pos.y = h.top; toMove("Idle", 0.3); });
+  placeHang();
+  startRM("Climb_Up", null, () => { p.pos.y = h.top; toMove("Idle", 0.3); }, { fade: 0.15 });
 }
 
 function tryTraversal(intent) {   // Space on the ground: vault / climb / wall run-up before a normal jump
@@ -503,17 +530,18 @@ function tryTraversal(intent) {   // Space on the ground: vault / climb / wall r
     const land = p.pos.clone().addScaledVector(f, ob.near + ob.depth + 1.1);
     const g = groundAt(land.x, land.z, 0.25, p.pos.y + 0.5);
     if (g > -Infinity) {
-      startRM("Dive_Over", warpFor("Dive_Over", g - p.pos.y, ob.near + ob.depth + 1.1), () => { p.pos.y = g; toMove(sp > 4 ? "Running" : "Idle", 0.2); p.vel.copy(f).multiplyScalar(Math.min(sp, 5)); }, { speed: 1.35 });
+      // authored for a block 0.8 m ahead and 0.7 m deep; stretch the travel to this block
+      startRM("Vault", warpFor("Vault", g - p.pos.y, ob.near + ob.depth + 1.25), () => { p.pos.y = g; toMove(sp > 4 ? "Running" : "Idle", 0.2); p.vel.copy(f).multiplyScalar(Math.min(sp, 5)); }, { speed: clamp(sp / 3.6, 1, 1.5), fade: 0.1 });
       return true;
     }
   }
-  if (ob.h <= 1.9) {
-    startRM("Climb_Box", warpFor("Climb_Box", ob.h, ob.near + 0.55), () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); }, { speed: 1.5 });
+  const variant = (name) => { const v = LIB.__variant(name, ob.h, Math.max(0.15, ob.near - 0.05)); const key = v.clip.name; CLIPS[key] = v.clip; RM[key] = v.rm; return key; };
+  if (ob.h <= 1.9) {   // mantle, rebuilt for this exact height and distance so the hands land on the edge
+    startRM(variant("Climb_Box"), null, () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); }, { speed: 1.15, fade: 0.1 });
     return true;
   }
-  if (ob.h <= 3.3 && sp > 5.5) {   // sprinting: run up the wall; otherwise a jump catches the ledge
-    const name = "Wall_Climb";
-    startRM(name, warpFor(name, ob.h, ob.near + 0.55), () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); });
+  if (ob.h <= 3.3 && sp > 5) {   // sprinting: run up the wall; otherwise a jump catches the ledge
+    startRM(variant("Wall_Climb"), null, () => { p.pos.y = ob.box.max.y; toMove("Idle", 0.25); }, { fade: 0.1 });
     return true;
   }
   return false;
@@ -527,20 +555,29 @@ function nearestEnemy(range, cone = 1.2) {
   }
   return best;
 }
+// hitT (contact frame) and reach are measured from each clip at load time, so a hit lands when the fist / foot / pipe is out
 const ATK = {
-  Jab: { dmg: 12, range: 1.7, hit: 0.32, combo: 0.45, push: 1.5 },
-  Cross: { dmg: 15, range: 1.7, hit: 0.36, combo: 0.5, push: 2 },
-  Hook: { dmg: 22, range: 1.75, hit: 0.42, combo: 0.6, push: 4, big: true },
-  Kick: { dmg: 26, range: 2.0, hit: 0.42, combo: 0.75, push: 5, big: true },
-  Pipe_Swing: { dmg: 30, range: 2.1, hit: 0.4, combo: 0.55, push: 3 },
-  Pipe_Backhand: { dmg: 30, range: 2.1, hit: 0.38, combo: 0.55, push: 3 },
-  Pipe_Smash: { dmg: 48, range: 2.1, hit: 0.45, combo: 0.75, push: 6, big: true },
+  Jab: { dmg: 12, push: 0.6, limb: "hand" },
+  Cross: { dmg: 15, push: 0.8, limb: "hand" },
+  Hook: { dmg: 22, push: 1.0, big: true, limb: "hand" },
+  Kick: { dmg: 26, push: 1.2, big: true, limb: "foot" },
+  Pipe_Swing: { dmg: 30, push: 0.8, limb: "pipe" },
+  Pipe_Backhand: { dmg: 30, push: 0.8, limb: "pipe" },
+  Pipe_Smash: { dmg: 48, push: 1.2, big: true, limb: "pipe" },
 };
-function startAttack(name) {
-  const p = player; const clip = CLIPS[name]; if (!clip) return;
-  const e = nearestEnemy(3.5, 1.6); if (e) p.yaw = Math.atan2(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
-  p.state = "attack"; p.atk = { name, t: 0, dur: clip.duration, did: false, target: e, ...ATK[name] }; p.queued = false;
-  p.anim.play(name, { once: true, fade: 0.08, restart: true, speed: 1.15 });
+const CONTACT = 0.22;   // distance from an enemy's centre to the surface a fist should meet
+function startAttack(name, combo = false) {
+  const p = player; const clip = CLIPS[name], at = ATK[name]; if (!clip || !at) return;
+  const e = nearestEnemy(3.2, 1.6) || nearestEnemy(2.2, Math.PI); if (e) p.yaw = Math.atan2(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
+  // enter the strike at the frame closest to the pose we are in now -> no snap between punches
+  p.model.updateMatrixWorld(true);
+  const start = bestEntry(name, featOf(p.feat, p.model));
+  // close a small gap with the body (max 0.3 m, eased to the contact frame) instead of sliding the whole attack
+  let step = 0;
+  if (e) { const d = Math.hypot(e.pos.x - p.pos.x, e.pos.z - p.pos.z); step = clamp(d - (at.reach + CONTACT), -0.15, 0.3); }
+  p.state = "attack"; p.queued = false;
+  p.atk = { name, t: start, start, dur: clip.duration, hitT: Math.max(at.hitT, start + 0.08), did: false, target: e, step, origin: p.pos.clone(), ...at };
+  p.anim.play(name, { once: true, fade: combo ? 0.16 : 0.12, restart: true, start, speed: 1.1 });
 }
 function nextCombo(name) {
   const chain = player.weapon ? ["Pipe_Swing", "Pipe_Backhand", "Pipe_Smash"] : ["Jab", "Cross", "Hook"];
@@ -553,28 +590,42 @@ function damagePlayer(dmg) {
   const p = player; if (p.state === "dead") return;
   p.hp = Math.max(0, p.hp - dmg); flash(); shake(0.15);
   if (p.hp <= 0) { p.state = "dead"; p.t = 0; p.anim.play("Death", { once: true, fade: 0.1 }); dropPipe(); return; }
-  if (p.state === "move" || p.state === "attack") { p.state = "hit"; p.t = 0; p.anim.play("Hit", { once: true, fade: 0.06, restart: true }); }
+  if (p.state === "move" || p.state === "attack") { p.state = "hit"; p.t = 0; p.anim.play("Hit", { once: true, fade: 0.06, restart: true }); p.crouch = false; }
 }
 function respawn() {
   const p = player; p.pos.copy(SPAWN); p.vel.set(0, 0, 0); p.hp = 100; p.yaw = 0; cam.yaw = Math.PI; toMove("Idle", 0.1);
 }
 function pickupPipe() {
   const p = player; if (p.weapon) return false;
-  const pipe = PIPES.find((q) => !q.held && q.mesh.position.distanceTo(new V3(p.pos.x, 0.05, p.pos.z)) < 1.3);
+  const pipe = PIPES.find((q) => !q.held && q.mesh.position.distanceTo(new V3(p.pos.x, 0.05, p.pos.z)) < 1.4);
   if (!pipe) return false;
-  p.state = "pickup"; p.t = 0; p.pickTarget = pipe; p.yaw = Math.atan2(pipe.mesh.position.x - p.pos.x, pipe.mesh.position.z - p.pos.z);
-  p.anim.play("Pickup", { once: true, fade: 0.12, speed: 1.3, restart: true });
+  const to = new V3().subVectors(pipe.mesh.position, p.pos); to.y = 0;
+  p.yaw = Math.atan2(to.x, to.z);
+  // turn the pipe to lie along the reach (the fist closes with the thumb forward), then step so the hand meets its grip end
+  pipe.mesh.rotation.set(0, p.yaw + Math.PI / 2, Math.PI / 2); pipe.mesh.position.y = 0.035;
+  const local = rotY(to, -p.yaw);
+  const hand = new V3(PICK.x, 0, PICK.z - 0.04);
+  const addX = clamp(local.x - hand.x, -0.4, 0.4), addZ = clamp(local.z - LIB.__pipeGrip.pos.length() * 0 - 0.355 - hand.z, -0.5, 0.7);
+  startRM("Pickup", { sx: 1, sy: 1, sz: 1, addX, addZ, kT: PICK.grab }, () => toMove("Pipe_Idle", 0.25), {
+    fade: 0.15, at: { t: PICK.grab, fn: () => attachPipe(pipe) },
+  });
   return true;
 }
-function attachPipe(pipe) {
+function attachPipe(pipe) {   // the fist closes on the pipe; ease it into the grip so nothing pops
   const p = player; pipe.held = true; p.weapon = pipe;
-  p.hand.add(pipe.mesh); pipe.mesh.position.set(0.0, 0.08, 0.03); pipe.mesh.rotation.set(0, 0, Math.PI / 2);
-  pipe.mesh.scale.setScalar(1);
+  p.hand.attach(pipe.mesh);
+  p.pipeEase = { t: 0, p0: pipe.mesh.position.clone(), q0: pipe.mesh.quaternion.clone() };
+}
+function updatePipeEase(dt) {
+  const p = player, e = p.pipeEase; if (!e || !p.weapon) return;
+  e.t = Math.min(1, e.t + dt / 0.14); const k = ss(e.t), m = p.weapon.mesh, g = LIB.__pipeGrip;
+  m.position.copy(e.p0).lerp(g.pos, k); m.quaternion.copy(e.q0).slerp(g.quat, k);
+  if (e.t >= 1) p.pipeEase = null;
 }
 function dropPipe() {
   const p = player; if (!p.weapon) return; const m = p.weapon.mesh;
-  scene.attach(m); m.position.set(p.pos.x + 0.4, 0.05, p.pos.z + 0.2); m.rotation.set(0, Math.random() * 3, Math.PI / 2);
-  p.weapon.held = false; p.weapon = null;
+  scene.attach(m); m.position.set(p.pos.x + 0.4, 0.035, p.pos.z + 0.2); m.rotation.set(0, Math.random() * 3, Math.PI / 2);
+  p.weapon.held = false; p.weapon = null; p.pipeEase = null;
 }
 
 function updatePlayer(dt) {
@@ -588,7 +639,8 @@ function updatePlayer(dt) {
   switch (p.state) {
     case "move": {
       const sprint = keys.ShiftLeft || keys.ShiftRight, walk = keys.AltLeft;
-      const target = moving ? (sprint ? 7.6 : walk ? 1.7 : 4.4) : 0;
+      if (sprint && moving) p.crouch = false;
+      const target = moving ? (sprint ? 6.4 : p.crouch ? 1.3 : walk ? 1.15 : 4.4) : 0;
       const accel = p.grounded ? (moving ? 34 : 26) : 7;
       const want = input.clone().multiplyScalar(target);
       const hv = new V3(p.vel.x, 0, p.vel.z);
@@ -611,7 +663,7 @@ function updatePlayer(dt) {
       if (!p.grounded) {
         p.air += dt;
         // horizontal bars: hands reach ~2.1 m above the feet
-        const hands = p.pos.clone().add(new V3(0, HANDS.Bar_Hang.y, 0));
+        const hands = p.pos.clone().add(new V3(0, BAR - 0.03, 0));
         for (const b of BARS) {
           const ab = b.b.clone().sub(b.a), t = clamp(hands.clone().sub(b.a).dot(ab) / ab.lengthSq(), 0, 1);
           const c = b.a.clone().addScaledVector(ab, t);
@@ -620,38 +672,42 @@ function updatePlayer(dt) {
         if (p.state !== "move") break;
         const ledge = findLedge(p.pos, p.yaw, 1.0, 2.35, 0.7);
         if (ledge && p.vel.y < 4.5) { hangOn(ledge); break; }
-        if (p.air > 0.25 || p.vel.y < -2.5) p.anim.play("Fall", { fade: 0.25 });
+        if ((p.air > 0.25 && p.anim.name !== "Jump") || p.vel.y < -1.5) p.anim.play("Fall", { fade: 0.3 });
       } else {
         if (!wasG) {   // landing
           p.air = 0;
           if (vyBefore < -10.5) {
-            if (sp > 3 || vyBefore > -15) { p.state = "roll"; p.t = 0; p.anim.play("Roll_Land", { once: true, fade: 0.08, speed: 1.15, restart: true }); shake(0.18); break; }
-            p.state = "land"; p.t = 0; p.anim.play("Land", { once: true, fade: 0.06, restart: true }); shake(0.22); p.vel.x *= 0.2; p.vel.z *= 0.2; break;
+            if (sp > 3 || vyBefore > -15) { p.state = "roll"; p.t = 0; p.anim.play("Roll_Land", { once: true, fade: 0.06, restart: true }); shake(0.18); break; }
+            p.state = "land"; p.t = 0; p.anim.play("Land", { once: true, fade: 0.05, restart: true }); shake(0.22); p.vel.x *= 0.2; p.vel.z *= 0.2; break;
           }
+          if (vyBefore < -6 && sp < 1.5) { p.state = "land"; p.t = 0.18; p.anim.play("Land", { once: true, fade: 0.05, restart: true, start: 0.04 }); p.vel.x *= 0.3; p.vel.z *= 0.3; break; }
         }
         if (p.jumpBuf > 0 && p.coyote > 0) {
           p.jumpBuf = 0;
           if (!tryTraversal(moving ? (sprint ? 7 : 4) : 0)) {
             const ledge = findLedge(p.pos, p.yaw, 1.6, 2.4, 0.9);
             if (ledge && sp < 3) { hangOn(ledge); break; }
-            p.vel.y = 8.4; p.grounded = false; p.coyote = 0; p.air = 0;
-            p.anim.play("Jump_Run", { once: true, fade: 0.1, start: 0.18, speed: 1.3, restart: true });
+            p.vel.y = 8.4; p.grounded = false; p.coyote = 0; p.air = 0; p.crouch = false;
+            p.anim.play("Jump", { once: true, fade: 0.08, start: 0.04, restart: true });
           }
           break;
         }
-        if (slide && moving && (sp > 3 || sprint)) { p.state = "slide"; p.t = 0; p.slideV = Math.max(sp, 7); p.anim.play("Slide", { once: true, fade: 0.1, start: 0.25, speed: 1.1, restart: true }); break; }
+        if (slide && moving && (sp > 3 || sprint)) { p.state = "slide"; p.t = 0; p.slideV = Math.max(sp, 6.5); p.anim.play("Slide", { once: true, fade: 0.08, restart: true }); break; }
+        if (slide) p.crouch = !p.crouch;
         if (attack) { startAttack(p.weapon ? "Pipe_Swing" : "Jab"); break; }
         if (heavy) { startAttack(p.weapon ? "Pipe_Smash" : "Kick"); break; }
         if (use && pickupPipe()) break;
         const ob = obstacleAhead(p.pos, p.yaw, 1.0);
-        if (ob && ob.h > 0.3) prompt = ob.h <= 1.2 && ob.depth < 1.6 ? "Space · vault" : ob.h <= 1.9 ? "Space · climb" : ob.h <= 3.3 ? "Sprint + Space · wall climb" : "";
+        if (ob && ob.h > 0.3) prompt = ob.h <= 1.2 && ob.depth < 1.6 ? "Space · vault (run) / climb" : ob.h <= 1.9 ? "Space · climb" : ob.h <= 3.3 ? "Sprint + Space · wall climb" : "";
         if (!p.weapon && PIPES.some((q) => !q.held && q.mesh.position.distanceTo(new V3(p.pos.x, 0.05, p.pos.z)) < 1.3)) prompt = "E · pick up pipe";
         // locomotion clips
+        // locomotion: each clip plays at the speed its feet were keyed for, so planted feet don't skate
         const fighting = enemies.some((e) => !e.dead && e.pos.distanceTo(p.pos) < 6);
-        if (sp < 0.25) p.anim.play(p.weapon ? "Pipe_Idle" : fighting ? "Fight_Idle" : "Idle", { fade: 0.25 });
-        else if (sp < 2.6) p.anim.play("Walking", { fade: 0.2, speed: clamp(sp / 1.5, 0.6, 1.5) });
-        else if (sp < 5.6) p.anim.play(p.weapon ? "Pipe_Run" : "Running", { fade: 0.2, speed: clamp(sp / 4.4, 0.75, 1.3) });
-        else p.anim.play("Sprint", { fade: 0.2, speed: clamp(sp / 7.2, 0.85, 1.2) });
+        if (p.crouch) { if (sp < 0.2) p.anim.play("Crouch_Idle", { fade: 0.3 }); else p.anim.play("Sneak_Walk", { fade: 0.25, speed: clamp(sp / LIB.Sneak_Walk.speed, 0.5, 1.4) }); }
+        else if (sp < 0.2) p.anim.play(p.weapon ? "Pipe_Idle" : fighting ? "Fight_Idle" : "Idle", { fade: 0.3 });
+        else if (sp < 1.9) p.anim.play(p.weapon ? "Pipe_Walk" : "Walking", { fade: 0.25, speed: clamp(sp / LIB.Walking.speed, 0.5, 1.5) });
+        else if (sp < 5.2) p.anim.play(p.weapon ? "Pipe_Run" : "Running", { fade: 0.22, speed: clamp(sp / 4.4, 0.7, 1.25) });
+        else p.anim.play("Sprint", { fade: 0.22, speed: clamp(sp / LIB.Sprint.speed, 0.85, 1.2) });
       }
       break;
     }
@@ -660,7 +716,7 @@ function updatePlayer(dt) {
       const f = fwdOf(p.yaw); p.vel.x = f.x * p.slideV; p.vel.z = f.z * p.slideV;
       p.grounded = collide(p, dt, R, 0.95, true);
       const blocked = boxes.some((b) => b.min.y < p.pos.y + HEIGHT && b.min.y > p.pos.y + 0.5 && circleRect(p.pos.x, p.pos.z, R, b));
-      if (p.t > 0.85 && !blocked) { p.state = "move"; }
+      if (p.t > 0.88 && !blocked) { p.state = "move"; }
       break;
     }
     case "roll": case "land": {
@@ -680,10 +736,10 @@ function updatePlayer(dt) {
       if (side) {
         const left = rotY(new V3(1, 0, 0), p.yaw);
         const along = h.t.dot(left) * side;   // move along tangent
-        const s = (h.n.x ? h.pt.z : h.pt.x) + along * 1.1 * dt;
-        if (s > h.lo && s < h.hi) { if (h.n.x) h.pt.z = s; else h.pt.x = s; placeHang(); }
-        p.anim.play(side > 0 ? "Shimmy_L" : "Shimmy_R", { fade: 0.15 });
-      } else p.anim.play("Hang_Idle", { fade: 0.2 });
+        const s = (h.n.x ? h.pt.z : h.pt.x) + along * SHIMMY * dt;
+        if (s > h.lo && s < h.hi) { if (h.n.x) h.pt.z = s; else h.pt.x = s; placeHang(); p.travel += SHIMMY * dt; }
+        p.anim.sync(side > 0 ? "Shimmy_L" : "Shimmy_R", p.travel, SHIMMY * LIB.Shimmy_L.clip.duration, 0.15);
+      } else p.anim.play("Hang_Idle", { fade: 0.25 });
       break;
     }
     case "bar": {
@@ -692,8 +748,8 @@ function updatePlayer(dt) {
       const ab = b.b.clone().sub(b.a), len = ab.length();
       if (side) {
         const left = rotY(new V3(1, 0, 0), p.yaw); const dir = ab.clone().normalize().dot(left) * side;
-        p.barT = clamp(p.barT + dir * 1.3 * dt / len, 0, 1);
-        p.anim.play("Bar_Move", { fade: 0.2 });
+        p.barT = clamp(p.barT + dir * BARMOVE * dt / len, 0, 1); p.travel += BARMOVE * dt;
+        p.anim.sync(side > 0 ? "Bar_Move_L" : "Bar_Move_R", p.travel, BARMOVE * LIB.Bar_Move_L.clip.duration, 0.15);
       } else p.anim.play("Bar_Hang", { fade: 0.25 });
       placeBar();
       if (jump || slide || ((p.barT <= 0 || p.barT >= 1) && side)) {
@@ -707,51 +763,46 @@ function updatePlayer(dt) {
     case "rope": {
       const r = p.rope; prompt = "W/S climb · Space jump off";
       const dir = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-      p.pos.y = clamp(p.pos.y + dir * (dir > 0 ? 1.2 : 2.2) * dt, r.y0 - 0.2, r.y1 - HANDS.Rope_Climb.y);
-      const a = p.anim.play("Rope_Climb", { fade: 0.2 }); if (a) a.timeScale = dir === 0 ? 0 : dir > 0 ? 1 : -1.4;
+      p.pos.y = clamp(p.pos.y + dir * (dir > 0 ? 0.75 : 1.4) * dt, r.y0 - 0.2, r.y1 - 1.75);
+      p.anim.sync("Rope_Climb", p.pos.y, ROPE.rise, 0.2);
       placeRope();
       if (p.pos.y <= r.y0 - 0.15 && dir < 0) { toMove("Idle", 0.2); p.pos.y = groundAt(p.pos.x, p.pos.z, 0.2, p.pos.y + 0.5); }
-      if (jump) { const f = fwdOf(p.yaw); p.state = "move"; p.grounded = false; p.air = 0.3; p.vel.set(-f.x * 3.5, 6.5, -f.z * 3.5); p.yaw += Math.PI; p.grabCool = 0.5; p.anim.play("Jump_Run", { once: true, fade: 0.1, start: 0.3, restart: true }); }
+      if (jump) { const f = fwdOf(p.yaw); p.state = "move"; p.grounded = false; p.air = 0.3; p.vel.set(-f.x * 3.5, 6.5, -f.z * 3.5); p.yaw += Math.PI; p.grabCool = 0.5; p.anim.play("Jump", { once: true, fade: 0.12, start: 0.1, restart: true }); }
       break;
     }
     case "ladder": {
       const l = p.ladder; prompt = "W/S climb · Space jump off";
       const dir = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-      p.pos.y = Math.max(0, p.pos.y + dir * 1.5 * dt);
-      const a = p.anim.play("Ladder", { fade: 0.2 }); if (a) a.timeScale = dir === 0 ? 0 : dir;
-      if (p.pos.y + HANDS.Ladder.y > l.y1 + 0.15) {   // reached the top: braced-hang climb over the edge
+      p.pos.y = Math.max(0, p.pos.y + dir * 0.85 * dt);
+      p.anim.sync("Ladder", p.pos.y + 1.29, LAD.rise, 0.2);   // phase 0 = left hand closing on a rung (rungs at 0.3 + 0.35k)
+      if (p.pos.y + 1.62 > l.y1 + 0.05) {   // hands at the top: climb over the edge from a hang
         p.hang = { pt: new V3(l.x, l.y1, l.z), n: l.n.clone(), top: l.y1, t: new V3(-l.n.z, 0, l.n.x), lo: -1e9, hi: 1e9 };
         p.yaw = Math.atan2(-l.n.x, -l.n.z); climbFromHang(); break;
       }
       if (dir < 0 && p.pos.y <= 0.01) { toMove("Idle", 0.2); break; }
-      if (jump) { p.state = "move"; p.grounded = false; p.vel.set(l.n.x * 3, 4, l.n.z * 3); p.yaw += Math.PI; p.anim.play("Fall", { fade: 0.2 }); }
+      if (jump) { p.state = "move"; p.grounded = false; p.vel.set(l.n.x * 3, 4, l.n.z * 3); p.yaw += Math.PI; p.grabCool = 0.5; p.anim.play("Fall", { fade: 0.2 }); }
       break;
     }
     case "attack": {
-      const a = p.atk; a.t += dt * 1.15;
-      if (a.target && !a.target.dead) { p.yaw += angDiff(p.yaw, Math.atan2(a.target.pos.x - p.pos.x, a.target.pos.z - p.pos.z)) * Math.min(1, dt * 12); }
-      const gap = a.target ? a.target.pos.distanceTo(p.pos) - 1.0 : 0.3;
-      if (a.t < a.dur * 0.35 && gap > 0) { const f = fwdOf(p.yaw), lv = Math.min(5, gap * 6 + 1); p.vel.x = f.x * lv; p.vel.z = f.z * lv; } else { p.vel.x *= 0.8; p.vel.z *= 0.8; }
-      p.grounded = collide(p, dt, R, HEIGHT, true);
+      const a = p.atk; a.t += dt * 1.1;
+      if (a.target && !a.target.dead && a.t < a.hitT) p.yaw += angDiff(p.yaw, Math.atan2(a.target.pos.x - p.pos.x, a.target.pos.z - p.pos.z)) * Math.min(1, dt * 10);
+      // the body closes the gap inside the strike (eased, done by the contact frame) - no free sliding
+      const k = ss(clamp((a.t - a.start) / Math.max(0.05, a.hitT - a.start), 0, 1));
+      const f = fwdOf(p.yaw); p.pos.x = a.origin.x + f.x * a.step * k; p.pos.z = a.origin.z + f.z * a.step * k;
+      p.vel.set(0, p.vel.y, 0); p.grounded = collide(p, dt, R, HEIGHT, true);
       if (attack || heavy) p.queued = heavy ? "heavy" : "light";
-      if (!a.did && a.t >= a.dur * a.hit) {
+      if (!a.did && a.t >= a.hitT) {
         a.did = true;
         for (const e of enemies) {
           if (e.dead) continue; const d = new V3().subVectors(e.pos, p.pos); d.y = 0; const dist = d.length();
-          if (dist < a.range && fwdOf(p.yaw).dot(d.normalize()) > 0.35) { e.damage(a.dmg, d, a.push, a.big); hitstop = a.big ? 0.09 : 0.055; shake(a.big ? 0.16 : 0.08); }
+          if (dist < a.reach + CONTACT + 0.35 && fwdOf(p.yaw).dot(d.normalize()) > 0.45) { e.damage(a.dmg, d, a.push, a.big); hitstop = a.big ? 0.08 : 0.05; shake(a.big ? 0.14 : 0.07); }
         }
       }
-      if (a.t >= a.dur * a.combo && p.queued) {
+      if (a.t >= a.hitT + 0.08 && p.queued) {
         const nxt = p.queued === "heavy" ? (p.weapon ? "Pipe_Smash" : "Kick") : nextCombo(a.name);
-        if (nxt && nxt !== a.name) { startAttack(nxt); break; }
+        if (nxt && nxt !== a.name) { startAttack(nxt, true); break; }
       }
-      if (a.t >= a.dur * 0.92) { p.state = "move"; }
-      break;
-    }
-    case "pickup": {
-      p.t += dt * 1.3; p.vel.set(0, 0, 0);
-      if (p.pickTarget && p.t > 0.55) { attachPipe(p.pickTarget); p.pickTarget = null; }
-      if (p.t > (CLIPS.Pickup?.duration ?? 1.5) * 0.85) p.state = "move";
+      if (a.t >= Math.min(a.dur - 0.05, a.hitT + 0.5)) { p.state = "move"; p.anim.play(p.weapon ? "Pipe_Idle" : "Fight_Idle", { fade: 0.3 }); }
       break;
     }
     case "hit": { p.t += dt; p.vel.x *= 0.85; p.vel.z *= 0.85; p.grounded = collide(p, dt, R, HEIGHT, true); if (p.t > 0.45) p.state = "move"; break; }
@@ -765,35 +816,36 @@ function grabBar(b, t) {
   const ab = b.b.clone().sub(b.a).normalize(); const perp = new V3(-ab.z, 0, ab.x);
   const f = fwdOf(p.yaw); const face = f.dot(perp) >= 0 ? perp : perp.negate();
   p.yaw = Math.atan2(face.x, face.z); p.state = "bar"; p.bar = b; p.barT = t; p.vel.set(0, 0, 0);
-  p.anim.play("Bar_Hang", { fade: 0.12 }); placeBar(); shake(0.08);
+  p.anim.play("Bar_Hang", { fade: 0.12 }); placeBar(); shake(0.08); p.travel = 0;
 }
 function placeBar() {
-  const p = player, b = p.bar; const c = b.a.clone().lerp(b.b, p.barT); const off = rotY(HANDS.Bar_Hang, p.yaw);
-  p.pos.set(c.x - off.x, c.y - off.y, c.z - off.z);
+  const p = player, b = p.bar; const c = b.a.clone().lerp(b.b, p.barT); const f = fwdOf(p.yaw);
+  p.pos.set(c.x - f.x * 0.03, c.y - (BAR - 0.03), c.z - f.z * 0.03);   // hands close round the bar
 }
 function grabRope(r) {
   const p = player; if (p.grabCool > 0) return;
   p.state = "rope"; p.rope = r; p.vel.set(0, 0, 0);
-  p.yaw = Math.atan2(r.x - p.pos.x, r.z - p.pos.z); p.pos.y = clamp(p.pos.y, r.y0 - 0.2, r.y1 - HANDS.Rope_Climb.y);
-  placeRope(); p.anim.play("Rope_Climb", { fade: 0.12 });
+  p.yaw = Math.atan2(r.x - p.pos.x, r.z - p.pos.z); p.pos.y = clamp(p.pos.y, r.y0 - 0.2, r.y1 - 1.75);
+  placeRope(); p.anim.sync("Rope_Climb", p.pos.y, ROPE.rise, 0.12);
 }
 function placeRope() {
-  const p = player, r = p.rope; const off = rotY(HANDS.Rope_Climb, p.yaw);
-  p.pos.x = r.x - off.x; p.pos.z = r.z - off.z;
+  const p = player, r = p.rope; const f = fwdOf(p.yaw);
+  p.pos.x = r.x - f.x * ROPE.z; p.pos.z = r.z - f.z * ROPE.z;
 }
 function grabLadder(l) {
   const p = player; p.state = "ladder"; p.ladder = l; p.vel.set(0, 0, 0);
-  p.yaw = Math.atan2(-l.n.x, -l.n.z); const off = rotY(HANDS.Ladder, p.yaw);
-  p.pos.x = l.x + l.n.x * 0.06 - off.x; p.pos.z = l.z + l.n.z * 0.06 - off.z;
-  p.anim.play("Ladder", { fade: 0.15 });
+  p.yaw = Math.atan2(-l.n.x, -l.n.z);   // face the wall; the clip's hands are LAD.z in front of the root
+  p.pos.x = l.x + l.n.x * (0.06 + LAD.z); p.pos.z = l.z + l.n.z * (0.06 + LAD.z);
+  p.anim.sync("Ladder", p.pos.y + 1.29, LAD.rise, 0.15);
 }
 
 // =============================================================== enemies (raiders, same skeleton -> same clips)
 const enemies = [];
+let ENGAGE = 0.95;   // set from the measured jab reach once clips load
 class Enemy {
   constructor(x, z) {
     this.model = SkeletonUtils.clone(raiderSrc); this.root = new THREE.Group(); this.root.add(this.model); scene.add(this.root);
-    this.anim = new Anim(this.model); this.spawn = new V3(x, 0, z); this.pos = this.spawn.clone(); this.vel = new V3();
+    this.anim = new Anim(this.model, this); this.spawn = new V3(x, 0, z); this.pos = this.spawn.clone(); this.vel = new V3();
     this.yaw = Math.random() * 6; this.hp = 100; this.state = "idle"; this.t = 0; this.cool = 1 + Math.random(); this.dead = false;
     this.anim.play("Idle", { start: Math.random() * 3 });
     const bar = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 0.06), new THREE.MeshBasicMaterial({ color: 0xd9685c, depthTest: false, transparent: true }));
@@ -801,9 +853,11 @@ class Enemy {
   }
   damage(dmg, dir, push, big) {
     if (this.dead) return;
-    this.hp -= dmg; this.vel.x = dir.x * push; this.vel.z = dir.z * push; this.yaw = Math.atan2(-dir.x, -dir.z);
-    if (this.hp <= 0) { this.dead = true; this.state = "dead"; this.t = 0; this.anim.play("Death", { once: true, fade: 0.08, restart: true }); return; }
-    this.state = "hit"; this.t = 0; this.anim.play(big ? "Hit_Big" : "Hit", { once: true, fade: 0.05, restart: true });
+    this.hp -= dmg; this.yaw = Math.atan2(-dir.x, -dir.z);
+    const shove = big ? 0 : push; this.vel.x = dir.x * shove; this.vel.z = dir.z * shove;
+    if (this.hp <= 0) { this.dead = true; this.state = "dead"; this.t = 0; this.vel.x = dir.x * 1.2; this.vel.z = dir.z * 1.2; this.anim.play("Death", { once: true, fade: 0.08, restart: true }); return; }
+    this.state = "hit"; this.t = 0; this.hitDur = big ? 0.8 : 0.45;
+    this.anim.play(big ? "Hit_Big" : "Hit", { once: true, fade: 0.05, restart: true, rm: big });
   }
   update(dt) {
     const p = player; this.t += dt;
@@ -816,14 +870,14 @@ class Enemy {
     }
     const d = new V3().subVectors(p.pos, this.pos); d.y = 0; const dist = d.length();
     const aware = dist < 13 && p.state !== "dead" && Math.abs(p.pos.y - this.pos.y) < 1.5;
-    if (this.state === "hit") { this.vel.multiplyScalar(0.86); if (this.t > 0.55) this.state = "idle"; }
+    if (this.state === "hit") { this.vel.multiplyScalar(0.8); if (this.t > this.hitDur) this.state = "idle"; }
     else if (this.state === "attack") {
       this.vel.multiplyScalar(0.8);
       if (!this.did && this.t > this.hitAt) {
         this.did = true;
-        if (dist < 1.55 && fwdOf(this.yaw).dot(d.clone().normalize()) > 0.5 && !["hang", "bar", "rope", "ladder", "rm"].includes(p.state)) damagePlayer(this.dmg);
+        if (dist < this.reach + CONTACT + 0.3 && fwdOf(this.yaw).dot(d.clone().normalize()) > 0.5 && !["hang", "bar", "rope", "ladder", "rm"].includes(p.state)) damagePlayer(this.dmg);
       }
-      if (this.t > this.dur * 0.9) { this.state = "idle"; this.cool = 1.2 + Math.random() * 1.2; }
+      if (this.t > Math.min(this.dur - 0.05, this.hitAt + 0.6)) { this.state = "idle"; this.cool = 1.2 + Math.random() * 1.2; this.anim.play("Fight_Idle", { fade: 0.3 }); }
     } else {
       this.cool -= dt;
       if (aware) {
@@ -835,7 +889,7 @@ class Enemy {
           const back = dist < 2.6 ? -1 : 0; const f = fwdOf(this.yaw);
           this.vel.x = lerp(this.vel.x, side.x * 1.1 + f.x * back, dt * 4); this.vel.z = lerp(this.vel.z, side.z * 1.1 + f.z * back, dt * 4);
           this.anim.play("Fight_Idle", { fade: 0.3 });
-        } else if (dist > 1.35) {
+        } else if (dist > ENGAGE + 0.15) {
           const sp = dist > 4 ? 3.6 : 1.6; const f = fwdOf(this.yaw);
           this.vel.x = lerp(this.vel.x, f.x * sp, dt * 6); this.vel.z = lerp(this.vel.z, f.z * sp, dt * 6);
           this.anim.play(sp > 2 ? "Running" : "Walking", { fade: 0.2, speed: sp > 2 ? 0.85 : 1 });
@@ -843,8 +897,8 @@ class Enemy {
           this.vel.multiplyScalar(0.7);
           if (this.cool <= 0) {
             const n = ["Jab", "Cross", "Hook"][Math.floor(Math.random() * 3)];
-            this.state = "attack"; this.t = 0; this.did = false; this.dur = CLIPS[n].duration; this.hitAt = this.dur * ATK[n].hit; this.dmg = n === "Hook" ? 14 : 9;
-            this.anim.play(n, { once: true, fade: 0.1, restart: true });
+            this.state = "attack"; this.t = 0; this.did = false; this.dur = CLIPS[n].duration; this.hitAt = ATK[n].hitT; this.reach = ATK[n].reach; this.dmg = n === "Hook" ? 14 : 9;
+            this.anim.play(n, { once: true, fade: 0.14, restart: true });
           } else this.anim.play("Fight_Idle", { fade: 0.25 });
         }
       } else { this.vel.multiplyScalar(0.8); this.anim.play("Idle", { fade: 0.4 }); }
@@ -869,15 +923,18 @@ window.__drifter = {
   key(code, down) { if (down) { if (!keys[code]) pressed.add(code); keys[code] = true; } else keys[code] = false; },
   tap(code) { pressed.add(code); },
   state() { const p = player; return { state: p.state, clip: p.anim.name, pos: p.pos.toArray().map((v) => +v.toFixed(2)), yaw: +p.yaw.toFixed(2), hp: Math.round(p.hp), weapon: !!p.weapon, raiders: enemies.map((e) => e.dead ? "dead" : Math.round(e.hp) + "@" + e.pos.distanceTo(p.pos).toFixed(1) + e.state[0]) }; },
+  cam(yaw, pitch = 0.2, dist = 3.5) { cam.yaw = yaw; cam.pitch = pitch; cam.dist = dist; },
+  snap() { renderer.render(scene, camera); return canvas.toDataURL("image/jpeg", 0.8); },
+  atk: () => Object.fromEntries(Object.entries(ATK).map(([n, a]) => [n, { hitT: +a.hitT?.toFixed(2), reach: +a.reach?.toFixed(2), dur: +a.dur?.toFixed(2) }])),
   set(x, y, z, yaw = 0) { player.pos.set(x, y, z); player.yaw = yaw; player.vel.set(0, 0, 0); cam.yaw = yaw + Math.PI; toMove("Idle", 0); },
 };
 function tick(dt) {
   if (hitstop > 0) { hitstop -= dt; dt *= 0.08; }
   const p = player;
   updatePlayer(dt);
-  for (const e of enemies) { e.update(dt); e.root.position.copy(e.pos); e.root.rotation.y = e.yaw; e.anim.mixer.update(dt); }
+  for (const e of enemies) { e.update(dt); e.anim.update(dt); e.root.position.copy(e.pos); e.root.rotation.y = e.yaw; }
   p.root.position.copy(p.pos); p.root.rotation.y = p.yaw;
-  p.anim.mixer.update(dt);
+  p.anim.update(dt); updatePipeEase(dt);
   if (p.hp < 100 && p.state !== "dead") p.hp = Math.min(100, p.hp + dt * 2.5);
   // camera
   const tgt = p.pos.clone().add(new V3(0, 1.45, 0));
